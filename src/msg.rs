@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use cosmwasm_std::{Binary, Coin, Decimal, Uint128};
 use cw20::Expiration;
 pub use cw_controllers::ClaimsResponse;
-use cw_utils::Duration;
+use cw0::Duration;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct InstantiateMsg {
@@ -26,6 +26,8 @@ pub struct InstantiateMsg {
     /// This is the minimum amount we will pull out to reinvest, as well as a minimum
     /// that can be unbonded (to avoid needless staking tx)
     pub min_withdrawal: Uint128,
+
+    pub staking_withdraw_address: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -39,15 +41,14 @@ pub enum ExecuteMsg {
     /// Claim is used to claim your native tokens that you previously "unbonded"
     /// after the chain-defined waiting period (eg. 3 weeks)
     Claim {},
-    /// Reinvest will check for all accumulated rewards, withdraw them, and
-    /// re-bond them to the same validator. Anyone can call this, which updates
-    /// the value of the token (how much under custody).
-    Reinvest {},
-    /// _BondAllTokens can only be called by the contract itself, after all rewards have been
-    /// withdrawn. This is an example of using "callbacks" in message flows.
-    /// This can only be invoked by the contract itself as a return from Reinvest
-    _BondAllTokens {},
 
+
+    WithDrawDevCw20 { contract: String, amount: Uint128 },
+
+    SetStakingWithdrawAddress { addr: String },
+
+    Redelegate { validator: String },
+    
     /// Implements CW20. Transfer is a base message to move tokens to another account without triggering actions
     Transfer { recipient: String, amount: Uint128 },
     /// Implements CW20. Burn is a base message to destroy tokens forever
@@ -115,8 +116,6 @@ pub enum QueryMsg {
 pub struct InvestmentResponse {
     pub token_supply: Uint128,
     pub staked_tokens: Coin,
-    // ratio of staked_tokens / token_supply (or how many native tokens that one derivative token is nominally worth)
-    pub nominal_value: Decimal,
 
     /// owner created the contract and takes a cut
     pub owner: String,

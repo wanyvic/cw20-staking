@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use cosmwasm_std::{Addr, Decimal, Uint128};
 use cw_controllers::Claims;
 use cw_storage_plus::Item;
-use cw_utils::Duration;
+use cw0::Duration;
 
 pub const CLAIMS: Claims = Claims::new("claims");
 
@@ -26,13 +26,13 @@ pub struct InvestmentInfo {
     /// This is the minimum amount we will pull out to reinvest, as well as a minimum
     /// that can be unbonded (to avoid needless staking tx)
     pub min_withdrawal: Uint128,
+
+    pub staking_withdraw_address: String,
 }
 
 /// Supply is dynamic and tracks the current supply of staked and ERC20 tokens.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema, Default)]
 pub struct Supply {
-    /// issued is how many derivative tokens this contract has issued
-    pub issued: Uint128,
     /// bonded is how many native tokens exist bonded to the validator
     pub bonded: Uint128,
     /// claims is how many tokens need to be reserved paying back those who unbonded

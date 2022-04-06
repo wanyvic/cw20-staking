@@ -1,8 +1,8 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    coin, to_binary, Addr, BankMsg, Binary, Decimal, Deps, DepsMut, DistributionMsg, Env,
-    MessageInfo, QuerierWrapper, Response, StakingMsg, StdError, StdResult, Uint128, WasmMsg,
+    coin, to_binary, Addr, BankMsg, Binary, Deps, DepsMut, DistributionMsg, Env,
+    MessageInfo, QuerierWrapper, Response, StakingMsg, StdError, StdResult, Uint128, WasmMsg, WasmQuery, QueryRequest
 };
 
 use cw2::set_contract_version;
@@ -19,7 +19,7 @@ use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, InvestmentResponse, QueryMsg};
 use crate::state::{InvestmentInfo, Supply, CLAIMS, INVESTMENT, TOTAL_SUPPLY};
 
-const FALLBACK_RATIO: Decimal = Decimal::one();
+use cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 
 // version info for migration info
 const CONTRACT_NAME: &str = "crates.io:cw20-staking";
@@ -64,6 +64,7 @@ pub fn instantiate(
         bond_denom: denom,
         validator: msg.validator,
         min_withdrawal: msg.min_withdrawal,
+        staking_withdraw_address: msg.staking_withdraw_address
     };
     INVESTMENT.save(deps.storage, &invest)?;
 
@@ -71,7 +72,11 @@ pub fn instantiate(
     let supply = Supply::default();
     TOTAL_SUPPLY.save(deps.storage, &supply)?;
 
-    Ok(Response::default())
+    let res = Response::new()
+    .add_message(DistributionMsg::SetWithdrawAddress {
+        address: invest.staking_withdraw_address,
+    });
+    Ok(res)
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
@@ -85,8 +90,9 @@ pub fn execute(
         ExecuteMsg::Bond {} => bond(deps, env, info),
         ExecuteMsg::Unbond { amount } => unbond(deps, env, info, amount),
         ExecuteMsg::Claim {} => claim(deps, env, info),
-        ExecuteMsg::Reinvest {} => reinvest(deps, env, info),
-        ExecuteMsg::_BondAllTokens {} => _bond_all_tokens(deps, env, info),
+        ExecuteMsg::WithDrawDevCw20 { contract, amount } => withdraw_dev_cw20(deps, env, info, contract, amount),
+        ExecuteMsg::SetStakingWithdrawAddress { addr } => set_staking_withdraw_address(deps, info, addr),
+        ExecuteMsg::Redelegate { validator } => set_new_validator(deps, env, info, validator),
 
         // these all come from cw20-base to implement the cw20 standard
         ExecuteMsg::Transfer { recipient, amount } => {
@@ -186,13 +192,8 @@ pub fn bond(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Cont
     // in the end supply is just there to cache the (expected) results of get_bonded() so we don't
     // have expensive queries everywhere
     assert_bonds(&supply, bonded)?;
-    let to_mint = if supply.issued.is_zero() || bonded.is_zero() {
-        FALLBACK_RATIO * payment.amount
-    } else {
-        payment.amount.multiply_ratio(supply.issued, bonded)
-    };
+    let to_mint = payment.amount;
     supply.bonded = bonded + payment.amount;
-    supply.issued += to_mint;
     TOTAL_SUPPLY.save(deps.storage, &supply)?;
 
     // call into cw20-base to mint the token, call as self as no one else is allowed
@@ -260,12 +261,8 @@ pub fn unbond(
     // in the end supply is just there to cache the (expected) results of get_bonded() so we don't
     // have expensive queries everywhere
     assert_bonds(&supply, bonded)?;
-    let unbond = remainder.multiply_ratio(bonded, supply.issued);
+    let unbond = remainder;
     supply.bonded = bonded.checked_sub(unbond).map_err(StdError::overflow)?;
-    supply.issued = supply
-        .issued
-        .checked_sub(remainder)
-        .map_err(StdError::overflow)?;
     supply.claims += unbond;
     TOTAL_SUPPLY.save(deps.storage, &supply)?;
 
@@ -326,66 +323,94 @@ pub fn claim(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Con
     Ok(res)
 }
 
-/// reinvest will withdraw all pending rewards,
-/// then issue a callback to itself via _bond_all_tokens
-/// to reinvest the new earnings (and anything else that accumulated)
-pub fn reinvest(deps: DepsMut, env: Env, _info: MessageInfo) -> Result<Response, ContractError> {
-    let contract_addr = env.contract.address;
-    let invest = INVESTMENT.load(deps.storage)?;
-    let msg = to_binary(&ExecuteMsg::_BondAllTokens {})?;
 
-    // and bond them to the validator
+pub fn set_new_validator(deps: DepsMut, env: Env, info: MessageInfo, validator: String) -> Result<Response, ContractError> {
+    let mut invest = INVESTMENT.load(deps.storage)?;
+
+    if invest.owner != info.sender {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    let vals = deps.querier.query_all_validators()?;
+    if !vals.iter().any(|v| v.address == validator) {
+        return Err(ContractError::NotInValidatorSet {
+            validator: validator,
+        });
+    }
+
+    let bonds = deps.querier.query_delegation(env.contract.address, invest.validator.as_str())?;
+    let redelegate_coin = match bonds {
+        Some(full_delegation) => {
+            if full_delegation.can_redelegate.denom != invest.bond_denom {      
+                Err(ContractError::DifferentBondDenom {
+                    denom1: invest.bond_denom.clone(),
+                    denom2: full_delegation.can_redelegate.denom.into(),
+                })
+            } else {
+                Ok(full_delegation.can_redelegate)
+            }
+        },
+        _ => Err(ContractError::EmptyBalance {
+            denom: invest.bond_denom.clone(),
+        }),
+    }?;
+
+
     let res = Response::new()
-        .add_message(DistributionMsg::WithdrawDelegatorReward {
-            validator: invest.validator,
-        })
-        .add_message(WasmMsg::Execute {
-            contract_addr: contract_addr.to_string(),
-            msg,
-            funds: vec![],
+        .add_message(StakingMsg::Redelegate {
+            src_validator: invest.validator.clone(),
+            dst_validator: validator.clone(),
+            amount: redelegate_coin,
+        });
+    
+    invest.validator = validator;
+    INVESTMENT.save(deps.storage, &invest)?;
+    Ok(res)
+}
+
+pub fn set_staking_withdraw_address(deps: DepsMut, info: MessageInfo, addr: String) -> Result<Response, ContractError> {
+    
+    let mut invest = INVESTMENT.load(deps.storage)?;
+
+    if invest.owner != info.sender {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    invest.staking_withdraw_address = addr.clone();
+    INVESTMENT.save(deps.storage, &invest)?;
+
+    let res = Response::new()
+        .add_message(DistributionMsg::SetWithdrawAddress {
+            address: addr,
         });
     Ok(res)
 }
 
-pub fn _bond_all_tokens(
-    deps: DepsMut,
-    env: Env,
-    info: MessageInfo,
-) -> Result<Response, ContractError> {
-    // this is just meant as a call-back to ourself
-    if info.sender != env.contract.address {
+pub fn withdraw_dev_cw20(deps: DepsMut, env: Env, info: MessageInfo, contract: String, amount: Uint128) -> Result<Response, ContractError> {
+    
+    let invest = INVESTMENT.load(deps.storage)?;
+
+    if invest.owner != info.sender {
         return Err(ContractError::Unauthorized {});
     }
+    let balance_res: BalanceResponse = deps.querier.query(&QueryRequest::Wasm(WasmQuery::Smart {
+        contract_addr: contract.clone(),
+        msg: to_binary(&Cw20QueryMsg::Balance {
+            address: env.contract.address.into(),
+        })?,
+    }))?;
 
-    // find how many tokens we have to bond
-    let invest = INVESTMENT.load(deps.storage)?;
-    let mut balance = deps
-        .querier
-        .query_balance(&env.contract.address, &invest.bond_denom)?;
+    let to_send = balance_res.balance.min(amount);
 
-    // we deduct pending claims from our account balance before reinvesting.
-    // if there is not enough funds, we just return a no-op
-    match TOTAL_SUPPLY.update(deps.storage, |mut supply| -> StdResult<_> {
-        balance.amount = balance.amount.checked_sub(supply.claims)?;
-        // this just triggers the "no op" case if we don't have min_withdrawal left to reinvest
-        balance.amount.checked_sub(invest.min_withdrawal)?;
-        supply.bonded += balance.amount;
-        Ok(supply)
-    }) {
-        Ok(_) => {}
-        // if it is below the minimum, we do a no-op (do not revert other state from withdrawal)
-        Err(StdError::Overflow { .. }) => return Ok(Response::default()),
-        Err(e) => return Err(ContractError::Std(e)),
-    }
-
-    // and bond them to the validator
     let res = Response::new()
-        .add_message(StakingMsg::Delegate {
-            validator: invest.validator,
-            amount: balance.clone(),
-        })
-        .add_attribute("action", "reinvest")
-        .add_attribute("bonded", balance.amount);
+    .add_messages(vec![WasmMsg::Execute {
+        contract_addr: contract.into(),
+        msg: to_binary(&Cw20ExecuteMsg::Transfer {
+            recipient: invest.owner.into(),
+            amount: to_send,
+        })?,
+        funds: vec![],
+    }]);
     Ok(res)
 }
 
@@ -415,13 +440,8 @@ pub fn query_investment(deps: Deps) -> StdResult<InvestmentResponse> {
         exit_tax: invest.exit_tax,
         validator: invest.validator,
         min_withdrawal: invest.min_withdrawal,
-        token_supply: supply.issued,
+        token_supply: supply.bonded,
         staked_tokens: coin(supply.bonded.u128(), &invest.bond_denom),
-        nominal_value: if supply.issued.is_zero() {
-            FALLBACK_RATIO
-        } else {
-            Decimal::from_ratio(supply.bonded, supply.issued)
-        },
     };
     Ok(res)
 }
@@ -439,7 +459,7 @@ mod tests {
         Validator,
     };
     use cw_controllers::Claim;
-    use cw_utils::{Duration, DAY, HOUR, WEEK};
+    use cw0::{Duration, DAY, HOUR, WEEK};
 
     fn sample_validator(addr: &str) -> Validator {
         Validator {
@@ -486,6 +506,8 @@ mod tests {
     }
 
     const DEFAULT_VALIDATOR: &str = "default-validator";
+    const DEFAULT_STAKING_WITHDRAW_ADDRESS: &str = "default-staking-withdraw-address";
+
 
     fn default_instantiate(tax_percent: u64, min_withdrawal: u128) -> InstantiateMsg {
         InstantiateMsg {
@@ -496,6 +518,7 @@ mod tests {
             unbonding_period: DAY * 3,
             exit_tax: Decimal::percent(tax_percent),
             min_withdrawal: Uint128::new(min_withdrawal),
+            staking_withdraw_address: String::from(DEFAULT_STAKING_WITHDRAW_ADDRESS),
         }
     }
 
@@ -512,7 +535,7 @@ mod tests {
 
     #[test]
     fn instantiation_with_missing_validator() {
-        let mut deps = mock_dependencies();
+        let mut deps = mock_dependencies(&[]);
         deps.querier
             .update_staking("ustake", &[sample_validator("john")], &[]);
 
@@ -525,6 +548,7 @@ mod tests {
             unbonding_period: WEEK,
             exit_tax: Decimal::percent(2),
             min_withdrawal: Uint128::new(50),
+            staking_withdraw_address: String::from("my-address"),
         };
         let info = mock_info(&creator, &[]);
 
@@ -540,7 +564,7 @@ mod tests {
 
     #[test]
     fn proper_instantiation() {
-        let mut deps = mock_dependencies();
+        let mut deps = mock_dependencies(&[]);
         deps.querier.update_staking(
             "ustake",
             &[
@@ -560,6 +584,7 @@ mod tests {
             unbonding_period: HOUR * 12,
             exit_tax: Decimal::percent(2),
             min_withdrawal: Uint128::new(50),
+            staking_withdraw_address: String::from("my-address"),
         };
         let info = mock_info(&creator, &[]);
 
@@ -588,7 +613,6 @@ mod tests {
 
         assert_eq!(invest.token_supply, Uint128::zero());
         assert_eq!(invest.staked_tokens, coin(0, "ustake"));
-        assert_eq!(invest.nominal_value, Decimal::one());
     }
 
     #[test]
@@ -628,7 +652,6 @@ mod tests {
         let invest = query_investment(deps.as_ref()).unwrap();
         assert_eq!(invest.token_supply, Uint128::new(1000));
         assert_eq!(invest.staked_tokens, coin(1000, "ustake"));
-        assert_eq!(invest.nominal_value, Decimal::one());
 
         // token info also properly updated
         let token = query_token_info(deps.as_ref()).unwrap();
@@ -672,8 +695,6 @@ mod tests {
         let invest = query_investment(deps.as_ref()).unwrap();
         assert_eq!(invest.token_supply, Uint128::new(1000));
         assert_eq!(invest.staked_tokens, coin(1500, "ustake"));
-        let ratio = Decimal::from_str("1.5").unwrap();
-        assert_eq!(invest.nominal_value, ratio);
 
         // we bond some other tokens and get a different issuance price (maintaining the ratio)
         let alice = String::from("alice");
@@ -691,7 +712,6 @@ mod tests {
         let invest = query_investment(deps.as_ref()).unwrap();
         assert_eq!(invest.token_supply, Uint128::new(3000));
         assert_eq!(invest.staked_tokens, coin(4500, "ustake"));
-        assert_eq!(invest.nominal_value, ratio);
     }
 
     #[test]
@@ -763,14 +783,6 @@ mod tests {
         };
         let info = mock_info(&creator, &[]);
         let err = execute(deps.as_mut(), mock_env(), info, unbond_msg).unwrap_err();
-        assert_eq!(
-            err,
-            ContractError::Std(StdError::overflow(OverflowError::new(
-                OverflowOperation::Sub,
-                0,
-                600
-            )))
-        );
 
         // bob unbonds 600 tokens at 10% tax...
         // 60 are taken and send to the owner
@@ -813,7 +825,6 @@ mod tests {
         let invest = query_investment(deps.as_ref()).unwrap();
         assert_eq!(invest.token_supply, bobs_balance + owner_cut);
         assert_eq!(invest.staked_tokens, coin(690, "ustake")); // 1500 - 810
-        assert_eq!(invest.nominal_value, ratio);
     }
 
     #[test]
